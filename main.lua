@@ -1,7 +1,10 @@
 local ffi = require("ffi")
+require("lib.core")
+require("matrix")
 lg = love.graphics
+love.window.setFullscreen(true)
 
-local vert_res = 50
+local vert_res = 64
 local vert_count = vert_res * vert_res
 
 local verts = {}
@@ -24,15 +27,28 @@ uniform Image position_buffer;
 uniform Image colour_map;
 uniform bool draw_colour;
 
+uniform vec2 res;
+
+uniform mat4 view;
+uniform mat4 proj;
+
 varying float v_col;
+varying float v_depth;
 
 #ifdef VERTEX
 attribute vec2 VertexUV;
-vec4 position(mat4 proj, vec4 _pos) {
+vec4 position(mat4 love_proj, vec4 _pos) {
 	vec4 t = Texel(position_buffer, VertexUV);
-	vec2 pos = t.xy;
-	v_col = t.z;
-	return proj * vec4(pos, 0.0, 1.0);
+	vec3 pos = t.rgb;
+	v_col = t.a;
+
+	vec4 r = proj * view * vec4(pos, 1.0);
+
+	r.x /= res.x / res.y;
+
+	v_depth = 1.0;// - r.z;
+
+	return r;
 }
 #endif
 #ifdef PIXEL
@@ -40,41 +56,149 @@ vec4 effect(vec4 col, Image tex, vec2 uv, vec2 screenpos) {
 	if (!draw_colour) {
 		return vec4(1.0);
 	}
-	return Texel(colour_map, vec2(v_col, 0.0));
+	return Texel(colour_map, vec2(v_col, 0.0)) * v_depth;
 }
 #endif
 ]])
 
-ffi.cdef[[
-struct flame_transform{
-	//pre-transform
-	float axx, axy, axc;
-	float ayx, ayy, ayc;
+function init_view()
+	view = {
+		dirty = 	true,
+		from = 		vec3:xyz(0, 0, -1):smuli(50),
+		to = 		vec3:zero(),
+		right =     vec3:xyz(1,0,0),
+		up =        vec3:xyz(0,-1,0),
+		forward =   vec3:xyz(0,0,1),
+		zoom = 		vec3:xyz(1,1,1):smuli(0.01),
+	}
+end
 
-	//post-transform
-	float bxx, bxy, bxc;
-	float byx, byy, byc;
+function update_cam(dt)
 
-	//function lerps
-	float f_linear;
-	float f_sin;
-	float f_cos;
-	float f_tan;
-	float f_sqrt;
-	float f_spherical;
-};
-]]
+	if not _g_old_view then
+		_g_old_view = {}
+		--copy the vectors
+		for k,v in pairs(view) do
+			if type(v) == "table" and v.copy then
+				_g_old_view[k] = v:copy()
+			end
+		end
+	end
 
---todo: autogen cdef
+	--zoom
+	local zoom_factor = 1 + dt
+	if love.keyboard.isDown("z") then view.zoom:smuli(zoom_factor) end
+	if love.keyboard.isDown("x") then view.zoom:sdivi(zoom_factor) end
+
+	--rotate
+	local turn_speed = math.pi * 0.5 * dt
+	local function rotate_axes(on_axis, angle)
+		local m = rotation_axis_angle(on_axis, angle)
+		for i,v in ipairs {
+			"right", "up", "forward", "from",
+		} do
+			view[v] = transform_direction(view[v], m)
+		end
+	end
+	if love.keyboard.isDown("w") then rotate_axes(view.right, turn_speed) end
+	if love.keyboard.isDown("s") then rotate_axes(view.right, -turn_speed) end
+	if love.keyboard.isDown("a") then rotate_axes(view.up, turn_speed) end
+	if love.keyboard.isDown("d") then rotate_axes(view.up, -turn_speed) end
+	if love.keyboard.isDown("q") then rotate_axes(view.forward, turn_speed) end
+	if love.keyboard.isDown("e") then rotate_axes(view.forward, -turn_speed) end
+
+	--todo: re-orthoganalise
+
+	--check for changes automagically
+	local changed = false
+	for k,v in pairs(_g_old_view) do
+		if v:nequals(view[k]) then
+			changed = true
+			break
+		end
+	end
+	if changed then
+		view.dirty = true
+		for k,v in pairs(_g_old_view) do
+			v:vset(view[k])
+		end
+	end
+	if view.dirty then
+		
+		--translation
+		local sx, sy, sz = view.zoom:unpack()
+		local scale_mat = {
+			sx,0,0,0,
+			0,sy,0,0,
+			0,0,sz,0,
+			0,0,0,1,
+		}
+		local cam_mat = calculate_camera(view.from, view.to, view.up)
+		local view_mat = matmul4x4(cam_mat, scale_mat)
+
+		vert_mesh_shader:send("res", {lg:getDimensions()})
+		vert_mesh_shader:send("view", view_mat)
+		-- vert_mesh_shader:send("proj", calculate_perspective({lg:getDimensions()}, 1.0, 0.01, 200))
+		vert_mesh_shader:send("proj", {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,})
+	end
+end
 
 local transform_functions = {
-	{"linear", 		"i",},
-	{"sin", 		"sin(i)",},
-	{"cos", 		"cos(i)",},
-	{"tan", 		"tan(i)",},
-	{"sqrt", 		"sign(i) * sqrt(abs(i))",},
-	{"spherical", 	"i / (r * r)",},
+	{"linear", ([[
+		t = i;
+	]]),},
+	--multi component systems
+	{"sin", ([[
+		t = sin(i);
+	]]),},
+	--single component waves
+	{"sinx", ([[
+		t = vec3(i.x, sin(i.x), i.z);
+	]]),},
+	--sqrt all components
+	{"sqrt", ([[
+		t = sign(i) * sqrt(abs(i));
+	]]),},
+	--classical flame transforms extended to 3d where possible
+	{"spherical", ([[
+		t = i / r2;
+	]]),},
+	{"swirl", ([[
+		float c = cos(r2);
+		float s = sin(r2);
+		t = vec3(
+			c * i.x - s * i.y,
+			s * i.x + c * i.y,
+			i.z
+		);
+	]]),},
+	{"horseshoe", ([[
+		t = vec3(
+			(i.x - i.y) * (i.x + i.y),
+			2.0 * i.x * i.y,
+			i.z
+		) / r;
+	]]),},
+	{"polar", ([[
+		t = vec3(
+			theta / pi,
+			r - 1.0,
+			i.z
+		);
+	]])},
 }
+
+--autogen cdef
+ffi.cdef([[
+struct flame_transform{
+	//transforms
+	float pre[12];
+	float post[12];
+
+	//function lerps
+	float function_weights[]]..#transform_functions..[[];
+};
+]])
 
 local transform_functions_ordered = {}
 for i,v in ipairs(transform_functions) do
@@ -87,7 +211,9 @@ for i,v in ipairs(transform_functions) do
 	table.insert(functions_snippet, table.concat{
 		"float ", var_name, " = transforms[idx++];\n",
 		"if (abs(", var_name, ") != 0.0) {\n",
-		"\to += ", var_name, " * ", v[2], ";\n",
+		"\tvec3 t = vec3(0.0);",
+		v[2], "\n",
+		"\to = ", var_name, " * t + o;\n",
 		"}",
 	})
 end
@@ -97,53 +223,54 @@ local position_buffer = lg.newCanvas(vert_res, vert_res, {format="rgba32f"})
 local position_buffer_previous = lg.newCanvas(vert_res, vert_res, {format="rgba32f"})
 local position_shader = lg.newShader([[
 const int MAX_TRANSFORMS = 8;
-const int TRANSFORM_SIZE = 6 + 6 + 6;
+const int TRANSFORM_SIZE = 12 + 12 + 6;
 uniform int transform_count;
 uniform int transform_offset;
 uniform int transform_stride;
 uniform float transforms[MAX_TRANSFORMS * TRANSFORM_SIZE];
 
-vec2 tr(vec2 i, int tr) {
+mat4 read_mat4(int idx) {
+	return mat4(
+		transforms[idx+0], transforms[idx+4], transforms[idx+8],  0.0,
+		transforms[idx+1], transforms[idx+5], transforms[idx+9],  0.0,
+		transforms[idx+2], transforms[idx+6], transforms[idx+10], 0.0,
+		transforms[idx+3], transforms[idx+7], transforms[idx+11], 1.0
+	);
+}
+
+vec3 tr(vec3 i, int tr) {
 	int idx = tr * TRANSFORM_SIZE;
 
 	///////////////////////////////////
-	//pre-transform
-	float axx = transforms[idx++];
-	float axy = transforms[idx++];
-	float axc = transforms[idx++];
-
-	float ayx = transforms[idx++];
-	float ayy = transforms[idx++];
-	float ayc = transforms[idx++];
-
-	i = vec2(
-		axx * i.x + axy * i.y + axc,
-		ayx * i.x + ayy * i.y + ayc
-	);
+	//collect transforms
+	mat4 a = read_mat4(idx); idx += 12;
+	mat4 b = read_mat4(idx); idx += 12;
 
 	///////////////////////////////////
-	//post-transform
-	float bxx = transforms[idx++];
-	float bxy = transforms[idx++];
-	float bxc = transforms[idx++];
-
-	float byx = transforms[idx++];
-	float byy = transforms[idx++];
-	float byc = transforms[idx++];
+	//pre-transform
+	i = (a * vec4(i, 1.0)).xyz;
 
 	///////////////////////////////////
 	//apply activation
-	float r = length(i);
 
-	vec2 o = vec2(0.0);
+	//common parameters
+	//distance from origin
+	float r2 = i.x * i.x + i.y * i.y + i.z * i.z;
+	float r = sqrt(r2);
+	
+	//angles; todo 3d?
+	float theta = atan(i.y / i.x);
+	float phi = atan(i.x / i.y);
+	const float pi = 3.14159265359;
+
+	//accumulate output in here
+	vec3 o = vec3(0.0);
 	
 	]]..functions_snippet..[[
 
-	//(apply post)
-	o = vec2(
-		bxx * o.x + bxy * o.y + bxc,
-		byx * o.x + byy * o.y + byc
-	);
+	///////////////////////////////////
+	//post-transform
+	o = (b * vec4(o, 1.0)).xyz;
 
 	return o;
 }
@@ -162,80 +289,22 @@ vec4 effect(vec4 color, Image tex, vec2 uv, vec2 screenpos) {
 	vec4 t = Texel(tex, uv);
 	//apply
 	return vec4(
-		tr(t.xy, int(transform)),
+		tr(t.xyz, int(transform)),
 		//equidistant colours
-		mix(t.z, (float(transform) + 0.5) / float(transform_count), 0.5),
-		//full alpha
-		1.0
+		mix(t.w, float(transform) / (float(transform_count) - 1.0), 0.5)
 	);
 }
 #endif
 ]])
 
-local transforms = {
-	{
-		pre = {
-			offset = {0.3, 0.1},
-			angle = 0.5,
-			around = {1.0, 0.0},
-			scale = {0.95, 0.95},
-		},
-		post = {
-			offset = {0.0, 0.0},
-			angle = 0.0,
-			around = {0.0, 0.0},
-			scale = {1.0, 1.0},
-		},
-		func = "sqrt",
-	},
-	{
-		pre = {
-			offset = {0.0, -1.0},
-			angle = 0.3,
-			around = {-1.0, 1.0},
-			scale = {1.1, 1.1},
-		},
-		post = {
-			offset = {0.0, 0.0},
-			angle = 0.0,
-			around = {0.0, 0.0},
-			scale = {1.0, 1.0},
-		},
-		func = "spherical",
-	},
-	{
-		pre = {
-			offset = {1.0, 0.0},
-			angle = -0.2,
-			around = {0.0, 1.0},
-			scale = {0.95, 0.95},
-		},
-		post = {
-			offset = {0.0, 0.0},
-			angle = 0.0,
-			around = {0.0, 0.0},
-			scale = {1.0, 1.0},
-		},
-		func = "spherical",
-	},
-	{
-		pre = {
-			offset = {1.3, 1.3},
-			angle = -0.7,
-			around = {1.0, 1.0},
-			scale = {1.15, 1.15},
-		},
-		post = {
-			offset = {0.0, 0.0},
-			angle = 0.0,
-			around = {0.0, 0.0},
-			scale = {1.0, 1.0},
-		},
-		func = "spherical",
-	},
-}
+local transforms = {}
 
 function to_tr(t)
+	--todo: parse nice transforms again
+	if true then
+		return nil
+	end
+
 	local c = math.cos(t.angle)
 	local s = math.sin(t.angle)
 
@@ -259,21 +328,20 @@ function upload_transforms()
 	for i,v in ipairs(transforms) do
 		local t = tr_ser[i - 1]
 
-		--transforms
-		t.axx, t.axy, t.axc, t.ayx, t.ayy, t.ayc = unpack(to_tr(v.pre))
-		t.bxx, t.bxy, t.bxc, t.byx, t.byy, t.byc = unpack(to_tr(v.post))
-
-		--normalised rule amounts
+		--copy rule amounts
 		local rule_amounts = {}
 		local func = v.func
 		for i, v in ipairs(transform_functions_ordered) do
 			local f = 0
 			if type(func) == "table" then
 				if func[v] then
-					--set table
+					--key value table
 					f = func[v]
 				else
-					--ordered table of either {"f", v} or "f"
+					--ordered table of either
+					--	{"f", v}
+					--	or "f"
+					--	or in-order numeric rule weights
 					for ci, cf in ipairs(func) do
 						if type(cf) == "string" and (v == cf) then
 							f = 1
@@ -291,12 +359,17 @@ function upload_transforms()
 			end
 			table.insert(rule_amounts, f)
 		end
-		t.f_linear =    rule_amounts[1]
-		t.f_sin =       rule_amounts[2]
-		t.f_cos =       rule_amounts[3]
-		t.f_tan =       rule_amounts[4]
-		t.f_sqrt =      rule_amounts[5]
-		t.f_spherical = rule_amounts[6]
+
+		--copy transforms
+		for i = 1, 12 do
+			t.pre[i  - 1] = v.pre[i]
+			t.post[i - 1] = v.post[i]
+		end
+
+		--todo: this could probably be an array :)
+		for i,v in ipairs(rule_amounts) do
+			t.function_weights[i - 1] = v
+		end
 	end
 	position_shader:send("transforms", tr_d)
 	position_shader:send("transform_count", count)
@@ -305,45 +378,196 @@ end
 function random_transforms()
 	--
 	transforms = {}
-	for i = 1, love.math.random(2, 8) do
-		--randomly select 1-3 rules with random weighting
+
+	local function _random_rule()
+		return love.math.random(1, #transform_functions)
+	end
+
+	--primary transform for the set
+	local primary_transform = _random_rule()
+
+	--generate a certain number of rules
+	for i = 1, love.math.random(3, 6) do
+		--randomly select a few rules with random weighting
+		local rules_max = love.math.random(1, 3)
+		local rules_count  = love.math.random(1, rules_max)
 		local function_weights = {}
-		for i,v in ipairs(transform_functions_ordered) do
-			function_weights[i] = 0
-		end
-		for i = 1, love.math.random(1, 3) do
-			function_weights[love.math.random(1, #function_weights)] = 0.25 + love.math.random()
+		for i,v in ipairs(transform_functions_ordered) do function_weights[i] = 0 end
+		for i = 0, rules_count do
+			local f = _random_rule()
+			if i == 0 then
+				f = primary_transform
+			end
+			function_weights[f] = love.math.randomNormal()
+			print(transform_functions[f][1], function_weights[f])
 		end
 		--normalise
 		local t = 0
 		for i,v in ipairs(function_weights) do
-			t = t + function_weights[i]
+			t = t + math.abs(function_weights[i])
 		end
 		for i,v in ipairs(function_weights) do
 			function_weights[i] = v / t
 		end
 
+		local function compute_transform(tr)
+			--start with identity
+			local t = {
+				1, 0, 0, 0,
+				0, 1, 0, 0,
+				0, 0, 1, 0,
+				0, 0, 0, 1,
+			}
+			--scale
+			local sx, sy, sz = unpack(tr.scale)
+			local scale_mat = {
+				sx, 0, 0, 0,
+				0, sy, 0, 0,
+				0, 0, sz, 0,
+				0, 0, 0, 1,
+			};
+
+			--rotate
+			local rotation_mat = {
+				1, 0, 0, 0,
+				0, 1, 0, 0,
+				0, 0, 1, 0,
+				0, 0, 0, 1,
+			}
+			if t.euler then
+				--euler angles
+				do
+					local a = t.euler[1]
+					local s = math.sin(a)
+					local c = math.cos(a)
+					rotation_mat = matmul4x4(rotation_mat, {
+						c, -s, 0, 0,
+						s, c, 0, 0,
+						0, 0, 1, 0,
+						0, 0, 0, 1,
+					})
+				end
+				do
+					local a = t.euler[1]
+					local s = math.sin(a)
+					local c = math.cos(a)
+					rotation_mat = matmul4x4(rotation_mat, {
+						c, 0, s, 0,
+						0, 1, 0, 0,
+						-s, 0, c, 0,
+						0, 0, 0, 1,
+					})
+				end
+				do
+					local a = t.euler[3]
+					local s = math.sin(a)
+					local c = math.cos(a)
+					rotation_mat = matmul4x4(rotation_mat, {
+						1, 0, 0, 0,
+						0, c, -s, 0,
+						0, s, c, 0,
+						0, 0, 0, 1,
+					})
+				end
+			elseif t.quat then
+				--quaternion
+				local w, x, y, z = unpack(t.quat)
+
+				--cayley
+				if w ~= 0 then
+					x = x / w
+					y = y / w
+					z = z / w
+					w = w / w
+				end
+
+				local n = w * w + x * x + y * y + z * z
+
+				--normalize
+				if false and n ~= 0 then
+					local len = math.sqrt(n)
+					w = w / len
+					x = x / len
+					y = y / len
+					z = z / len
+
+					n = 1
+				end
+
+
+				local s = 0
+				if n ~= 0 then
+					--
+					s = 2 / n
+
+				end
+				local wx = s * w * x
+				local wy = s * w * y
+				local wz = s * w * z
+
+				local xx = s * x * x
+				local xy = s * x * y
+				local xz = s * x * z
+
+				local yy = s * y * y
+				local yz = s * y * z
+
+				local zz = s * z * z
+
+				rotation_mat = {
+					1 - (yy + zz), 	xy - wz,		xz + wy, 		0,
+					xy + wz, 		1 - (xx + zz),	yz - wx,		0,
+					xz - wy,		yz + wx,		1 - (xx + yy),	0,
+					0,				0,				0,				1,
+				}
+
+			end
+
+			--apply offset
+			local ox, oy, oz = unpack(tr.offset)
+			local offset_mat = {
+				1, 0, 0, ox,
+				0, 1, 0, oy,
+				0, 0, 1, oz,
+				0, 0, 0, 1,
+			}
+
+			t = matmul4x4(scale_mat, t)
+			t = matmul4x4(rotation_mat, t)
+			t = matmul4x4(offset_mat, t)
+
+
+			--remove extra line which we don't upload
+			for i = 1, 4 do
+				table.remove(t)
+			end
+
+			return t
+		end
+
 		local function rt()
+			local function r(o, s)
+				return love.math.randomNormal(o, s)
+			end
 			return {
 				offset = {
-					love.math.randomNormal(),
-					love.math.randomNormal(),
-				},
-				angle = (love.math.random() * 2 - 1) * math.pi,
-				around = {
-					love.math.randomNormal(),
-					love.math.randomNormal(),
+					r(0, 1), r(0, 1), r(0, 1),
 				},
 				scale = {
-					love.math.randomNormal(1),
-					love.math.randomNormal(1),
+					r(1, 0.25), r(1, 0.25), r(1, 0.25),
+				},
+				-- euler = {
+				-- 	r(0, math.pi), r(0, math.pi), r(0, math.pi),
+				-- }
+				quat = {
+					r(0, 1), r(0, 1), r(0, 1), r(0, 1),
 				},
 			}
 		end
 
 		local t = {
-			pre = rt(),
-			post = rt(),
+			pre = compute_transform(rt()),
+			post = compute_transform(rt()),
 			func = function_weights,
 		}
 		table.insert(transforms, t)
@@ -351,30 +575,26 @@ function random_transforms()
 	upload_transforms()
 end
 
+random_transforms()
+
 function random_positions()
 	position_buffer:setFilter("nearest", "nearest")
 	position_buffer_previous:setFilter("nearest", "nearest")
 
+	local id = love.image.newImageData(vert_res, vert_res, "rgba32f")
+	id:mapPixel(function(x, y, r, g, b, a)
+		return
+			--pos
+			love.math.random() * 2 - 1,
+			love.math.random() * 2 - 1,
+			love.math.random() * 2 - 1,
+			--col
+			love.math.random()
+	end)
+	local im = love.graphics.newImage(id)
 	lg.setCanvas(position_buffer)
-	lg.clear(0,0,0,0)
-	for i = 1, 8 do
-		lg.setBlendMode(
-			(i % 2) == 0 and "add"
-			or "subtract"
-		)
-		for y = 1, vert_res do
-			for x = 1, vert_res do
-				lg.setColor(
-					love.math.random(),
-					love.math.random(),
-					love.math.random(),
-					1
-				)
-				lg.points(x - 1, y - 1)
-			end
-		end
-	end
-	lg.setColor(1,1,1,1)
+	lg.setBlendMode("replace", "premultiplied")
+	lg.draw(im)
 	lg.setBlendMode("alpha")
 	lg.setCanvas()
 
@@ -392,7 +612,7 @@ function update_positions()
 	position_shader:send("transform_offset", offset)
 	position_shader:send("transform_stride", love.math.random(1, 5))
 
-	--rotated to ensure proper scrambling
+	--rotated to get a bit more scrambling across elements
 	lg.draw(
 		position_buffer_previous,
 		vert_res, 0,
@@ -586,24 +806,8 @@ function new_colours()
 end
 new_colours()
 
-local view = {
-	dirty = true,
-	offset = {0, 0},
-	zoom = 100,
-	rotation = 0,
-}
-
 function draw_to_buffer()
-	lg.push()
-	lg.origin()
-	local bw, bh = screen_buffer:getDimensions()
-	
-	lg.translate(bw * 0.5, bh * 0.5)
-
-	lg.translate(view.offset[1], view.offset[2])
-	lg.rotate(view.rotation)
-	lg.scale(view.zoom, view.zoom)
-
+	--
 	lg.setShader(vert_mesh_shader)
 	vert_mesh_shader:send("position_buffer", position_buffer)
 
@@ -622,23 +826,22 @@ function draw_to_buffer()
 	lg.setCanvas()
 	lg.setShader()
 	lg.setBlendMode("alpha")
-	lg.pop()
 end
 
 local total_iters = 0
 local i = 0
-local iters = 100
-local trace_iters = 10
+local iters = 500
+local trace_iters = 15
 function _update()
 	if i == 0 then
 		random_positions()
-		for _ = 1, trace_iters do
-			update_positions()
-		end
+		update_positions()
 	else
 		update_positions()
 	end
-	draw_to_buffer()
+	if i > trace_iters then
+		draw_to_buffer()
+	end
 	i = i + 1
 	if i > iters then
 		i = 0
@@ -647,28 +850,16 @@ function _update()
 end
 
 function love.load()
+	init_view()
 end
 
 function love.update(dt)
+	update_cam(dt)
+
 	local now = love.timer.getTime()
 	while love.timer.getTime() - now < (10 / 1000) do
 		_update()
 	end
-
-	local vo = view.offset
-	local move_step = dt * 100
-	local zoom_scale = 1 + 0.5 * dt
-	local rotation_step = dt * math.pi * 0.1
-
-	if love.keyboard.isDown("w") then view.dirty = true; vo[2] = vo[2] + move_step end
-	if love.keyboard.isDown("s") then view.dirty = true; vo[2] = vo[2] - move_step end
-	if love.keyboard.isDown("a") then view.dirty = true; vo[1] = vo[1] + move_step end
-	if love.keyboard.isDown("d") then view.dirty = true; vo[1] = vo[1] - move_step end
-	if love.keyboard.isDown("q") then view.dirty = true; view.zoom = view.zoom / zoom_scale end 
-	if love.keyboard.isDown("e") then view.dirty = true; view.zoom = view.zoom * zoom_scale end 
-	if love.keyboard.isDown("r") then view.dirty = true; view.rotation = view.rotation - rotation_step end
-	if love.keyboard.isDown("f") then view.dirty = true; view.rotation = view.rotation + rotation_step end
-	if love.keyboard.isDown("c") then view.dirty = true end
 end
 
 function love.draw()
@@ -682,7 +873,9 @@ function love.draw()
 		exposure = 1.0
 		total_iters = 0
 		i = 0
-		draw_to_buffer()
+		for _ = 1, trace_iters * 2 do
+			_update()
+		end
 	end
 	
 	local max_buffer = calc_max(count_buffer)
@@ -696,7 +889,7 @@ function love.draw()
 	--debug
 	if love.keyboard.isDown("`") then
 		for i, v in ipairs {
-			string.format("total iters: %d x %d (%d x %d)", total_iters, vert_count, vert_res, vert_res)
+			string.format("total iters: %5.3e - %d x %d (%d x %d)", total_iters * vert_count, total_iters, vert_count, vert_res, vert_res)
 		} do
 			lg.print(v, 10, 10 + (i - 1) * 20)
 		end
@@ -733,6 +926,6 @@ function love.keypressed(k)
 
 	if k == "n" then
 		random_transforms()
-		view.dirty = true
+		init_view()
 	end
 end
