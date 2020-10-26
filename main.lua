@@ -4,7 +4,7 @@ require("lib.core")
 lg = love.graphics
 love.window.setFullscreen(true)
 
-local vert_res = 128
+local vert_res = 64
 local vert_count = vert_res * vert_res
 
 local verts = {}
@@ -17,7 +17,10 @@ for y = 1, vert_res do
 	end
 end
 local vert_mesh = lg.newMesh(
-	{{"VertexUV", "float", 2}},
+	{
+		{"VertexUV", "float", 2},
+		{"VertexPosition", "float", 1}, --required to keep love happy
+	},
 	verts,
 	"points",
 	"static"
@@ -179,7 +182,7 @@ local transform_functions = {
 
 --autogen cdef
 ffi.cdef([[
-struct flame_transform{
+struct flame_transform {
 	//transforms
 	float pre[6];
 	float post[6];
@@ -214,15 +217,13 @@ local position_shader = lg.newShader([[
 #pragma language glsl3
 
 const int MAX_TRANSFORMS = 8;
-const int TRANSFORM_SIZE = 6 + 6 + 6;
+const int TRANSFORM_SIZE = 6 + 6 + ]]..#transform_functions..[[;
 uniform int transform_count;
 uniform float transforms[MAX_TRANSFORMS * TRANSFORM_SIZE];
 
 //random function sampling
-const int SALT_DIM = 8;
-const int SALT_COUNT = SALT_DIM * SALT_DIM;
-uniform float salt_scale;
-uniform float transform_salt[SALT_COUNT];
+uniform float transform_salt_offset;
+uniform float transform_salt_scale;
 
 //todo uniform
 const float world_bounds = 100.0;
@@ -267,14 +268,14 @@ vec2 tr(vec2 v_i, int tr) {
 	//distance from origin
 	float r = length(i);
 	float r2 = r * r;
-	
+
 	//angles
 	float theta = atan2(i.y, i.x);
 	float phi = atan2(i.x, i.y);
 
 	//accumulate output in here
 	vec2 o = vec2(0.0);
-	
+
 	]]..functions_snippet..[[
 
 	///////////////////////////////////
@@ -295,22 +296,9 @@ vec2 tr(vec2 v_i, int tr) {
 	return o;
 }
 
-int get_salt_idx(vec2 screenpos) {
-	float x = floor(mod(screenpos.x * salt_scale, float(SALT_DIM)));
-	float y = floor(mod(screenpos.y * salt_scale, float(SALT_DIM)));
-	return int(y) * SALT_DIM + int(x);
-}
-
-float get_transform(vec2 screenpos) {
-	int salt_idx = get_salt_idx(screenpos);
-	float salt = transform_salt[salt_idx];
-	float salt_x = screenpos.x * salt;
-	float salt_y = screenpos.y * salt;
-	//pick the transform
-	return floor(mod(
-		floor(salt_x + salt_y),
-		float(transform_count)
-	));
+int get_transform(vec2 screenpos) {
+	float px = floor(screenpos.x * transform_salt_scale) + transform_salt_offset;
+	return (int(px) % transform_count);
 }
 
 #ifdef PIXEL
@@ -320,6 +308,7 @@ vec4 effect(vec4 color, Image tex, vec2 uv, vec2 screenpos) {
 	vec4 t = Texel(tex, uv);
 	//apply
 	return vec4(
+		//new position
 		tr(t.xy, int(transform)),
 		//equidistant colours
 		mix(t.z, float(transform) / (float(transform_count) - 1.0), 0.5),
@@ -334,23 +323,25 @@ local transforms = {}
 
 function upload_transforms()
 	local count = #transforms
-	local tr_d = love.data.newByteData(ffi.sizeof("struct flame_transform") * count)
-	local tr_ser = ffi.cast("struct flame_transform*", tr_d:getFFIPointer())
-	for i,v in ipairs(transforms) do
-		local t = tr_ser[i - 1]
+	local tr_data = love.data.newByteData(ffi.sizeof("struct flame_transform") * count)
+	local tr_ser = ffi.cast("struct flame_transform*", tr_data:getFFIPointer())
+	for i, transform in ipairs(transforms) do
+		local ser = tr_ser[i - 1]
 
 		--copy transforms
-		for i = 1, 6 do
-			t.pre[i  - 1] = v.pre[i]
-			t.post[i - 1] = v.post[i]
+		for ti, v in ipairs(transform.pre) do
+			ser.pre[ti - 1] = v
 		end
 
-		--todo: this could probably be an array :)
-		for i,v in ipairs(v.function_weights) do
-			t.function_weights[i - 1] = v
+		for ti, v in ipairs(transform.post) do
+			ser.post[ti - 1] = v
+		end
+
+		for ti, v in ipairs(transform.function_weights) do
+			ser.function_weights[ti - 1] = v
 		end
 	end
-	position_shader:send("transforms", tr_d)
+	position_shader:send("transforms", tr_data)
 	position_shader:send("transform_count", count)
 end
 
@@ -373,7 +364,7 @@ function random_transforms()
 
 	--primary transform for the set
 	local primary_rule = _random_rule()
-	
+
 	--minor rules
 	local minor_rules_count = math.max(0, love.math.random(-2, 2))
 	local minor_rules = {}
@@ -385,8 +376,6 @@ function random_transforms()
 	--totally random rules
 	local random_rules_allowed = chance(0.1)
 	local random_rules_chance = random_rules_allowed and love.math.random() * (2 / num_transforms) or 0
-
-
 
 	print("new config:")
 	for i,v in ipairs {
@@ -425,6 +414,42 @@ function random_transforms()
 		}
 	end
 
+	local function mutate_transform(t, amount)
+		--modify scale
+		local function _r()
+			return love.math.randomNormal(amount, 0)
+		end
+		local scale_modify_amount = 1 / 20
+		if chance(0.85) then
+			--uniform scale
+			t.scale:smuli(
+				1 - (amount * 0.5) + _r()
+			)
+		else
+			--bilateral scale
+			t.scale:smuli(
+				1 - (amount * 0.5) + _r(),
+				1 - (amount * 0.5) + _r()
+			)
+		end
+
+		--modify angle
+		t.angle = t.angle + _r() * 2 * math.pi
+
+		t.offset_before:saddi(_r(), _r())
+
+		if chance(0.5) then
+			--dependent on offset before
+			t.offset_after:vsubi(t.offset_before)
+		end
+		t.offset_after:saddi(_r(), _r())
+		return t
+	end
+
+	local function rt()
+		return mutate_transform(identity_transform(), math.lerp(0.1, 0.25, love.math.random()))
+	end
+
 	for i = 1, num_transforms do
 		--randomly select a few rules with random weighting for this transform
 		local rules_count  = love.math.random(1, rules_max)
@@ -452,115 +477,31 @@ function random_transforms()
 			function_weights[i] = v
 		end
 
-		local function r(o, s)
-			return love.math.randomNormal(o, s)
-		end
-
-		local function mutate_transform(t, amount)
-			--modify scale
-			local function _sc()
-				return math.lerp(1.0, math.lerp(0.75, 0.95, love.math.random()), amount)
-			end
-			if chance(0.75) then
-				--uniform scale
-				t.scale:smuli(_sc())
-			else
-				--bilateral scale
-				t.scale:smuli(_sc(), _sc())
-			end
-
-			--modify angle
-			t.angle = t.angle + math.lerp(0, (love.math.random() * 2 - 1) * math.pi, amount)
-
-			--modify offset
-			local function _oa()
-				return math.lerp(
-					0,
-					math.lerp(0.25, 0.5, love.math.random()) / t.scale:length(),
-					amount
-				)
-			end
-			t.offset_before:saddi(_oa(), 0):rotatei(love.math.random() * 2 * math.pi)
-			if chance(0.5) then
-				--dependent on offset before
-				t.offset_after:vsubi(t.offset_before):vaddi(vec2:xy(_oa(), 0):rotatei(love.math.random() * 2 * math.pi))
-			else
-				t.offset_after:saddi(_oa(), 0):rotatei(love.math.random() * 2 * math.pi)
-			end
-			return t
-		end
-
-		local function copy_transform(t)
-			local r = identity_transform()
-			r.scale:vset(t.scale)
-			r.offset_before:vset(t.offset_before)
-			r.offset_after:vset(t.offset_after)
-			r.angle = t.angle
-			return r
-		end
-
-		local function inverse_transform(t)
-			local r = identity_transform()
-			r.scale:sset(1, 1):vdivi(t.scale)
-			r.offset_before = t.offset_after:inverse()
-			r.offset_after = t.offset_before:inverse()
-			r.angle = -t.angle
-			return r
-		end
-
-		local function rt()
-			return mutate_transform(identity_transform(), 1.0)
-		end
-
 		local pre = rt()
 		local post = rt()
 
-		if chance(0.5) then
-			local previous = table.pick_random(transforms)
-			if previous then
-				post = copy_transform(previous.pre)
-				mutate_transform(post, 0.5)
-			end
-		end
-
-		if chance(0.75) then
-			pre = inverse_transform(post)
-		elseif chance(0.05) then
-			--one transform is identity
-			if chance(0.5) then
-				pre = identity_transform()
-			else
-				post = identity_transform()
-			end
-		end
-
-		--chance to modify both a bit
-		if chance(0.25) then
-			mutate_transform(pre, 0.1)
-			mutate_transform(post, 0.1)
-		end
-
 		--output
-		print("\trule", i)
-		for i,v in ipairs(function_weights) do
-			if v ~= 0 then
-				print("\t", transform_functions_ordered[i], v)
+		if true then
+			print("\trule", i)
+			for i,v in ipairs(function_weights) do
+				if v ~= 0 then
+					print("\t", transform_functions_ordered[i], v)
+				end
+			end
+			for i,v in ipairs({
+				{"pre", pre},
+				{"post", post},
+			}) do
+				local name, t = unpack(v)
+				print("\t", name, string.format(
+					"scale: (% 5f % 5f) angle: % 5f offsets: (% 5f % 5f) (% 5f % 5f)",
+					t.scale.x, t.scale.y,
+					t.angle,
+					t.offset_before.x, t.offset_before.y,
+					t.offset_after.x, t.offset_after.y
+				))
 			end
 		end
-		for i,v in ipairs({
-			{"pre", pre},
-			{"post", post},
-		}) do
-			local name, t = unpack(v)
-			print("\t", name, string.format(
-				"scale: (% 5f % 5f) angle: % 5f offsets: (% 5f % 5f) (% 5f % 5f)",
-				t.scale.x, t.scale.y,
-				t.angle,
-				t.offset_before.x, t.offset_before.y,
-				t.offset_after.x, t.offset_after.y
-			))
-		end
-
 
 		local t = {
 			pre = pre,
@@ -584,19 +525,10 @@ function random_positions()
 	position_buffer:setFilter("nearest", "nearest")
 	position_buffer_previous:setFilter("nearest", "nearest")
 
-	--(need camera for inverseTransformPoint)
-	lg.push()
-	apply_camera()
-
 	local id = love.image.newImageData(vert_res, vert_res, "rgba32f")
 	id:mapPixel(function(x, y, r, g, b, a)
 		x = (love.math.random() - 0.5) * 2
 		y = (love.math.random() - 0.5) * 2
-		if chance(0.5) then
-			--random pixel point rather than biunit square
-			local sw, sh = screen_buffer:getDimensions()
-			x, y = lg.inverseTransformPoint(love.math.random(0, sw), love.math.random(0, sh))
-		end
 		return
 			--pos
 			x, y,
@@ -605,36 +537,28 @@ function random_positions()
 			--unused
 			1
 	end)
-	lg.pop()
 
 	local im = love.graphics.newImage(id)
+	lg.push("all")
 	lg.setCanvas(position_buffer)
 	lg.setBlendMode("replace", "premultiplied")
 	lg.origin()
 	lg.draw(im)
-	lg.setBlendMode("alpha")
-	lg.setCanvas()
+	lg.pop()
 
 	upload_transforms()
 end
 
-local transform_salt = love.data.newByteData(ffi.sizeof("float") * 8 * 8)
 function update_positions()
 	--swap buffers
 	position_buffer, position_buffer_previous = position_buffer_previous, position_buffer
-	lg.setBlendMode("replace", "premultiplied")
 	lg.setCanvas(position_buffer)
 	lg.setShader(position_shader)
+	lg.setBlendMode("replace", "premultiplied")
 	--update random transform offset per-row
-	local offset = love.math.random(0, #transforms)
-
 	do
-		local tsp = ffi.cast("float*", transform_salt:getFFIPointer())
-		for i = 1, 8 * 8 do
-			tsp[i - 1] = love.math.random() * 2
-		end
-		position_shader:send("transform_salt", transform_salt)
-		position_shader:send("salt_scale", 0.5 + love.math.random())
+		position_shader:send("transform_salt_offset", love.math.random(0, #transforms - 1))
+		position_shader:send("transform_salt_scale", math.lerp(0.1, 0.5, love.math.random()))
 	end
 
 	--rotated to get a bit more scrambling across elements
@@ -662,7 +586,7 @@ vec4 effect(vec4 color, Image tex, vec2 uv, vec2 screenpos) {
 	{
 		for (int x = 0; x < sample_size; x++)
 		{
-			vec2 _uv = 
+			vec2 _uv =
 				//base uv
 				floor(uv * res)
 				//offset to edge
@@ -730,7 +654,7 @@ vec4 effect(vec4 color, Image tex, vec2 uv, vec2 screenpos) {
 	float highest = Texel(maximum, vec2(0.5)).a;
 
 	vec4 t = Texel(tex, uv);
-	//replace alpha with count buffer
+	//replace alpha from count buffer
 	t.a = Texel(count, uv).r;
 
 	//mean
@@ -783,7 +707,7 @@ local colour_map
 function new_colours()
 	local res = 256
 	local id = love.image.newImageData(res, 1)
-	
+
 	--hue params
 	local h_o = love.math.random()
 	local h_g = love.math.randomNormal(0, 0.1)
@@ -837,7 +761,7 @@ function apply_camera()
 	lg.origin()
 	local sx, sy = screen_buffer:getDimensions()
 	lg.translate(sx * 0.5, sy * 0.5)
-	
+
 	lg.scale(view.scale, view.scale)
 	lg.rotate(view.angle)
 	lg.translate(-view.offset.x, -view.offset.y)
@@ -853,7 +777,7 @@ function draw_to_buffer()
 	vert_mesh_shader:send("position_buffer", position_buffer)
 
 	lg.setBlendMode("add", "premultiplied")
-	
+
 	--draw colour into screen buffer
 	vert_mesh_shader:send("draw_colour", true)
 	lg.setCanvas(screen_buffer)
@@ -873,15 +797,14 @@ end
 
 local total_iters = 0
 local i = 0
-local iters = 5000
-local trace_iters = 15
+local iters = 1000
+local trace_iters = 20
 function _update()
 	if i == 0 then
 		random_positions()
-		update_positions()
-	else
-		update_positions()
 	end
+	update_positions()
+
 	if i > trace_iters then
 		draw_to_buffer()
 	end
@@ -956,7 +879,7 @@ function love.draw()
 		} do
 			lg.print(v, 10, 10 + (i - 1) * 20)
 		end
-		
+
 		lg.draw(max_buffer, 10, 80)
 
 		if not position_buffer_shader then
