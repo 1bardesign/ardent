@@ -366,15 +366,15 @@ function random_transforms()
 	local primary_rule = _random_rule()
 
 	--minor rules
-	local minor_rules_count = math.max(0, love.math.random(-2, 2))
+	local minor_rules_count = math.max(0, love.math.random(-1, 2))
 	local minor_rules = {}
 	while #minor_rules < minor_rules_count do
 		table.insert(minor_rules, _random_rule())
 	end
-	local minor_rule_chance = minor_rules_count > 0 and love.math.random() * (1 / num_transforms) or 0
+	local minor_rule_chance = minor_rules_count > 0 and love.math.random() * (2 / num_transforms) or 0
 
 	--totally random rules
-	local random_rules_allowed = chance(0.1)
+	local random_rules_allowed = chance(0.2)
 	local random_rules_chance = random_rules_allowed and love.math.random() * (2 / num_transforms) or 0
 
 	print("new config:")
@@ -633,7 +633,6 @@ function calc_max(t)
 	return final
 end
 
-
 local sw, sh = lg.getDimensions()
 --todo: supersample
 screen_buffer = lg.newCanvas(
@@ -797,8 +796,8 @@ end
 
 local total_iters = 0
 local i = 0
-local iters = 1000
-local trace_iters = 20
+local iters = 5000
+local trace_iters = 50
 function _update()
 	if i == 0 then
 		random_positions()
@@ -822,12 +821,12 @@ end
 function love.update(dt)
 	update_cam(dt)
 
-	local now = love.timer.getTime()
-	local time_spin = 10 / 1000
+	local time_spin = 10e-3
 	if love.keyboard.isDown("space") then
-		time_spin = 1
+		time_spin = time_spin * 10
 	end
-	while love.timer.getTime() - now < time_spin do
+	local start = love.timer.getTime()
+	while love.timer.getTime() - start < time_spin do
 		_update()
 	end
 end
@@ -875,7 +874,13 @@ function love.draw()
 	--debug
 	if love.keyboard.isDown("`") then
 		for i, v in ipairs {
-			string.format("total iters: %5.3e - %d x %d (%d x %d)", total_iters * vert_count, total_iters, vert_count, vert_res, vert_res)
+			("total iters: %5.3e - %d x %d (%d x %d)"):format(
+				total_iters * vert_count,
+				total_iters,
+				vert_count,
+				vert_res,
+				vert_res
+			)
 		} do
 			lg.print(v, 10, 10 + (i - 1) * 20)
 		end
