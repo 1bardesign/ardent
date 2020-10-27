@@ -4,7 +4,13 @@ require("lib.core")
 lg = love.graphics
 love.window.setFullscreen(true)
 
-local vert_res = 64
+local limit_iters = 1e8
+local total_iters = 0
+local i = 0
+local iter_depth = 20000
+local iter_trace = 50
+
+local vert_res = 100
 local vert_count = vert_res * vert_res
 
 local verts = {}
@@ -360,7 +366,7 @@ function random_transforms()
 	local num_transforms = love.math.random(3, 6)
 
 	--amount of rules allowed per-transform
-	local rules_max = 1 + math.floor(math.abs(love.math.randomNormal(0, 0.5)))
+	local rules_max = 1 + math.floor(math.abs(love.math.randomNormal() * 1.5))
 
 	--primary transform for the set
 	local primary_rule = _random_rule()
@@ -419,17 +425,16 @@ function random_transforms()
 		local function _r()
 			return love.math.randomNormal(amount, 0)
 		end
-		local scale_modify_amount = 1 / 20
 		if chance(0.85) then
 			--uniform scale
 			t.scale:smuli(
-				1 - (amount * 0.5) + _r()
+				1 + _r()
 			)
 		else
 			--bilateral scale
 			t.scale:smuli(
-				1 - (amount * 0.5) + _r(),
-				1 - (amount * 0.5) + _r()
+				1 + _r(),
+				1 + _r()
 			)
 		end
 
@@ -466,18 +471,28 @@ function random_transforms()
 			end
 			function_weights[f] = math.lerp(1, 5, love.math.random())
 		end
+
+
 		--normalise
+		local normalise_scale = 1
+		if chance(0.1) then
+			normalise_scale = normalise_scale + love.math.randomNormal()
+		end
+		--accumulate
 		local t = 0
 		for i,v in ipairs(function_weights) do
 			v = math.abs(v)
 			t = t + v
 		end
+		--scale
 		for i,v in ipairs(function_weights) do
 			v = v / t
-			function_weights[i] = v
+			function_weights[i] = v * normalise_scale
 		end
 
+		--random pre/post
 		local pre = rt()
+		--todo: post inverse of pre
 		local post = rt()
 
 		--output
@@ -558,7 +573,7 @@ function update_positions()
 	--update random transform offset per-row
 	do
 		position_shader:send("transform_salt_offset", love.math.random(0, #transforms - 1))
-		position_shader:send("transform_salt_scale", math.lerp(0.1, 0.5, love.math.random()))
+		position_shader:send("transform_salt_scale", math.lerp(1 / (#transforms * 3), 1 / 3, love.math.random()))
 	end
 
 	--rotated to get a bit more scrambling across elements
@@ -794,24 +809,25 @@ function draw_to_buffer()
 	lg.pop()
 end
 
-local total_iters = 0
-local i = 0
-local iters = 5000
-local trace_iters = 50
+local current_limit_iters = limit_iters
 function _update()
+	if total_iters >= current_limit_iters then
+		return "wait"
+	end
+
 	if i == 0 then
 		random_positions()
 	end
 	update_positions()
 
-	if i > trace_iters then
+	if i > iter_trace then
 		draw_to_buffer()
 	end
 	i = i + 1
-	if i > iters then
+	if i > iter_depth then
 		i = 0
 	end
-	total_iters = total_iters + 1
+	total_iters = total_iters + vert_count
 end
 
 function love.load()
@@ -827,7 +843,9 @@ function love.update(dt)
 	end
 	local start = love.timer.getTime()
 	while love.timer.getTime() - start < time_spin do
-		_update()
+		if _update() == "wait" then
+			break
+		end
 	end
 end
 
@@ -840,8 +858,9 @@ function love.draw()
 		lg.clear(0,0,0,0)
 		lg.setCanvas()
 		total_iters = 0
+		current_limit_iters = limit_iters
 		i = 0
-		for _ = 1, trace_iters * 2 do
+		for _ = 1, iter_trace * 2 do
 			_update()
 		end
 	end
@@ -875,11 +894,16 @@ function love.draw()
 	if love.keyboard.isDown("`") then
 		for i, v in ipairs {
 			("total iters: %5.3e - %d x %d (%d x %d)"):format(
-				total_iters * vert_count,
 				total_iters,
+				total_iters / vert_count,
 				vert_count,
 				vert_res,
 				vert_res
+			),
+			("progress: %05.2f%% (%5.3e / %5.3e)"):format(
+				total_iters / current_limit_iters * 100,
+				total_iters,
+				current_limit_iters
 			)
 		} do
 			lg.print(v, 10, 10 + (i - 1) * 20)
@@ -917,6 +941,13 @@ function love.keypressed(k)
 	end
 	if k == "r" and ctrl then
 		love.event.quit("restart")
+	end
+
+	--increase iter limit
+	if k == "space" then
+		if total_iters >= current_limit_iters then
+			current_limit_iters = current_limit_iters + limit_iters
+		end
 	end
 
 	if k == "m" or k == "n" then
